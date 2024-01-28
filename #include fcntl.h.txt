@@ -1,0 +1,295 @@
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <pwd.h>
+#include <signal.h>
+
+#define MAX_PROCESSES 20
+#define MAX_LINE_LENGTH 1024
+
+typedef struct {
+    int argc_cmd;
+    char **argv_cmd;
+    const char *input_file;
+    const char *output_file;
+} command;
+
+typedef struct {
+    int pid;
+    char status;
+    char command[MAX_LINE_LENGTH];
+    char username[MAX_LINE_LENGTH];
+} ProcessInfo;
+
+int comparePids(const void *a, const void *b) {
+    const ProcessInfo *pa = (const ProcessInfo *)a;
+    const ProcessInfo *pb = (const ProcessInfo *)b;
+    return pa->pid - pb->pid;
+}
+
+command parse(char *argv[], int argc) {
+    command result;
+    result.argc_cmd = 0;
+    result.argv_cmd = NULL;
+    result.input_file = NULL;
+    result.output_file = NULL;
+
+    int i;
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], ">") == 0) {
+            result.output_file = argv[i + 1];
+            break;
+        } else if (strcmp(argv[i], "<") == 0) {
+            result.input_file = argv[i + 1];
+            break;
+        } else if (strcmp(argv[i], "|") == 0) {
+            // Ignore the "|" here since it will be handled separately
+            continue;
+        }
+
+        result.argv_cmd = realloc(result.argv_cmd, (result.argc_cmd + 1) * sizeof(char *));
+        result.argv_cmd[result.argc_cmd] = strdup(argv[i]);
+        result.argc_cmd++;
+    }
+
+    result.argv_cmd[result.argc_cmd] = NULL;
+
+    return result;
+}
+
+void executeCommand(command result) {
+    int pid = fork();
+    if (pid == 0) {
+        if (result.input_file != NULL) {
+            int input_fd = open(result.input_file, O_RDONLY);
+            if (input_fd == -1) {
+                perror("Erro ao abrir o arquivo de entrada");
+                exit(1);
+            }
+            dup2(input_fd, 0);
+            close(input_fd);
+        }
+
+        if (result.output_file != NULL) {
+            int output_fd = open(result.output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (output_fd == -1) {
+                perror("Erro ao abrir o arquivo de saída");
+                exit(1);
+            }
+            dup2(output_fd, 1);
+            close(output_fd);
+        }
+
+        execvp(result.argv_cmd[0], result.argv_cmd);
+        perror("Erro ao executar o comando");
+        exit(1);
+    } else {
+        waitpid(pid, NULL, 0);
+    }
+
+    for (int i = 0; i < result.argc_cmd; i++) {
+        free(result.argv_cmd[i]);
+    }
+    free(result.argv_cmd);
+}
+
+void executeCommandWithPipe(command cmd1, command cmd2) {
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) {
+        perror("Erro ao criar o pipe");
+        exit(1);
+    }
+
+    int pid_cmd1 = fork();
+    if (pid_cmd1 == 0) {
+        // Código do processo filho (cmd1)
+        close(pipe_fd[0]); // Fecha a ponta de leitura do pipe
+
+        if (cmd1.input_file != NULL) {
+            int input_fd = open(cmd1.input_file, O_RDONLY);
+            if (input_fd == -1) {
+                perror("Erro ao abrir o arquivo de entrada");
+                exit(1);
+            }
+            dup2(input_fd, 0);
+            close(input_fd);
+        }
+
+        dup2(pipe_fd[1], 1); // Redireciona a saída padrão para a ponta de escrita do pipe
+        close(pipe_fd[1]);   // Fecha a ponta de escrita do pipe
+
+        execvp(cmd1.argv_cmd[0], cmd1.argv_cmd);
+        perror("Erro ao executar o comando cmd1");
+        exit(1);
+    } else if (pid_cmd1 > 0) {
+        // Código do processo pai
+        waitpid(pid_cmd1, NULL, 0);
+        close(pipe_fd[1]); // Fecha a ponta de escrita do pipe
+
+        int pid_cmd2 = fork();
+        if (pid_cmd2 == 0) {
+            // Código do processo filho (cmd2)
+            close(pipe_fd[1]); // Fecha a ponta de escrita do pipe
+
+            if (cmd2.output_file != NULL) {
+                int output_fd = open(cmd2.output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (output_fd == -1) {
+                    perror("Erro ao abrir o arquivo de saída");
+                    exit(1);
+                }
+                dup2(output_fd, 1);
+                close(output_fd);
+            }
+
+            dup2(pipe_fd[0], 0); // Redireciona a entrada padrão para a ponta de leitura do pipe
+            close(pipe_fd[0]);   // Fecha a ponta de leitura do pipe
+
+            execvp(cmd2.argv_cmd[0], cmd2.argv_cmd);
+            perror("Erro ao executar o comando cmd2");
+            exit(1);
+        } else if (pid_cmd2 > 0) {
+            // Código do processo pai
+            waitpid(pid_cmd2, NULL, 0);
+            close(pipe_fd[0]); // Fecha a ponta de leitura do pipe
+        } else {
+            perror("Erro ao criar o processo cmd2");
+            exit(1);
+        }
+    } else {
+        perror("Erro ao criar o processo cmd1");
+        exit(1);
+    }
+
+    // Limpa a memória alocada
+    for (int i = 0; i < cmd1.argc_cmd; i++) {
+        free(cmd1.argv_cmd[i]);
+    }
+    free(cmd1.argv_cmd);
+
+    for (int i = 0; i < cmd2.argc_cmd; i++) {
+        free(cmd2.argv_cmd[i]);
+    }
+    free(cmd2.argv_cmd);
+}
+
+void displayTop() {
+    char input[MAX_LINE_LENGTH];
+
+    while (1) {
+        FILE *fp = fopen("/proc/loadavg", "r");
+        if (fp != NULL) {
+            float loadavg_1, loadavg_5, loadavg_15;
+            int total_processes, running_processes;
+
+            fscanf(fp, "%f %f %f %d/%d", &loadavg_1, &loadavg_5, &loadavg_15, &running_processes, &total_processes);
+            fclose(fp);
+
+            printf("Load Average (1/5/15 mins): %.2f / %.2f / %.2f\n", loadavg_1, loadavg_5, loadavg_15);
+            printf("Total processes: %d\nRunning processes: %d\n", total_processes, running_processes);
+        }
+
+        ProcessInfo processes[MAX_PROCESSES];
+        int num_processes = 0;
+
+        DIR *dir;
+        struct dirent *entry;
+
+        if ((dir = opendir("/proc")) != NULL) {
+            while ((entry = readdir(dir)) != NULL && num_processes < MAX_PROCESSES) {
+                if ('0' <= entry->d_name[0] && entry->d_name[0] <= '9') {
+                    int pid = atoi(entry->d_name);
+
+                    char path[MAX_LINE_LENGTH];
+                    sprintf(path, "/proc/%d/status", pid);
+
+                    FILE *file = fopen(path, "r");
+                    if (file != NULL) {
+                        char line[MAX_LINE_LENGTH];
+                        while (fgets(line, sizeof(line), file) != NULL) {
+                            if (strncmp(line, "State:", 6) == 0) {
+                                sscanf(line, "State: %c", &processes[num_processes].status);
+                            } else if (strncmp(line, "Name:", 5) == 0) {
+                                sscanf(line, "Name: %[^\n]", processes[num_processes].command);
+                            } else if (strncmp(line, "Uid:", 4) == 0) {
+                                int uid;
+                                sscanf(line, "Uid: %d", &uid);
+
+                                struct passwd *pw = getpwuid(uid);
+                                if (pw != NULL) {
+                                    strncpy(processes[num_processes].username, pw->pw_name, sizeof(processes[num_processes].username));
+                                } else {
+                                    strncpy(processes[num_processes].username, "Unknown", sizeof(processes[num_processes].username));
+                                }
+                            }
+                        }
+                        fclose(file);
+
+                        processes[num_processes].pid = pid;
+                        num_processes++;
+                    }
+                }
+            }
+            closedir(dir);
+        }
+
+        // Ordenar os processos por ordem crescente do PID
+        qsort(processes, num_processes, sizeof(ProcessInfo), comparePids);
+
+        // Apresentar os processos no estado "running"
+        printf("PID\tStatus\tCommand\tUsername\n");
+        int running_count = 0;
+        for (int i = 0; i < num_processes; i++) {
+            if (processes[i].status == 'R') {
+                printf("%d\t%c\t%s\t%s\n", processes[i].pid, processes[i].status, processes[i].command, processes[i].username);
+                running_count++;
+            }
+        }
+
+        // Se não houver 20 processos "running", completar a lista com os restantes
+        for (int i = 0; i < num_processes && running_count < MAX_PROCESSES; i++) {
+            if (processes[i].status != 'R') {
+                printf("%d\t%c\t%s\t%s\n", processes[i].pid, processes[i].status, processes[i].command, processes[i].username);
+                running_count++;
+            }
+        }
+
+        printf("Enter 'q' to quit: ");
+        if (fgets(input, sizeof(input), stdin) != NULL && input[0] == 'q') {
+            break;
+        }
+        sleep(10);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc == 2 && strcmp(argv[1], "top") == 0) {
+        displayTop();
+    } else {
+        int i;
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "|") == 0) {
+                break;
+            }
+        }
+
+        if (i == argc) {
+            // Sem operador "|", executa o comando diretamente
+            command result = parse(argv + 1, argc - 1);
+            executeCommand(result);
+        } else {
+            // Com operador "|", divide os comandos cmd1 e cmd2
+            command cmd1 = parse(argv + 1, i - 1);
+            command cmd2 = parse(argv + i + 1, argc - i - 1);
+            executeCommandWithPipe(cmd1, cmd2);
+        }
+    }
+
+    return 0;
+}
+
+
